@@ -34,7 +34,7 @@ if (Test-Path -LiteralPath $bundledPayload -PathType Leaf) {
     throw 'Payload is missing and no download sources are specified.'
 }
 $baseline = (Get-Item -LiteralPath (Join-Path $root 'boot\boot-final.img')).FullName
-$baselineHash = '820d71fce5046b594a0c802623e9a658b3b6f6fa0f976f0090c6f76e9b8258c9'
+$baselineHash = 'b2c5db7b73afebf6b83a0b786000e768186c08e27daa6a8907bf24ff5d61bda2'
 if ((Get-Item -LiteralPath $baseline).Length -ne 100663296 -or (Get-FileHash -Algorithm SHA256 -LiteralPath $baseline).Hash.ToLowerInvariant() -cne $baselineHash) { throw 'Boot image does not match the verified Ubuntu menu variant.' }
 $fastboot = Join-Path $PSScriptRoot 'tools\fastboot.exe'
 $zstd = Join-Path $PSScriptRoot 'tools\zstd.exe'
@@ -60,8 +60,23 @@ $slot = CheckedFastboot -arguments @('-s',$serial,'getvar','current-slot')
 if ($product -notmatch '(?im)^\s*(?:\(bootloader\)\s*)?product:\s*(?:TB710FU|topaz_prc_wifi)\s*$') { throw 'Product is not confirmed as TB710FU; refusing.' }
 if ($unlocked -notmatch '(?im)unlocked:\s*yes\b') { throw 'Bootloader is not confirmed unlocked.' }
 if ($slot -notmatch '(?im)current-slot:\s*a\b') { throw 'Active slot is not confirmed as a.' }
-Write-Host 'This will erase the Ubuntu/Android userdata partition. Back up the device first.'
-if ((Read-Host 'Type ERASE to continue') -cne 'ERASE') { throw 'Cancelled.' }
+Write-Host '1: Clean installation from Android or Ubuntu (erases the selected partition).'
+Write-Host '2: Reinstall existing Ubuntu, preserving supported user accounts, home files and settings.'
+$choice = Read-Host 'Choose 1 or 2'
+if ($choice -ceq '1') {
+    $mode = 'clean'
+    Write-Host 'Clean installation erases all files on the Ubuntu/Android userdata partition.'
+    if ((Read-Host 'Type ERASE to continue') -cne 'ERASE') { throw 'Cancelled.' }
+} elseif ($choice -ceq '2') {
+    $mode = 'preserve'
+    # Refuse before flashing the installer if the expected Ubuntu partition is absent.
+    $archSize = CheckedFastboot -arguments @('-s',$serial,'getvar','partition-size:arch')
+    if ($archSize -notmatch '(?im)partition-size:arch:\s*0x[0-9a-f]+\b' -or $archSize -match '(?im)partition-size:arch:\s*0x0+\b') { throw 'Existing Ubuntu partition not confirmed; preserve mode refused.' }
+    Write-Host 'Preserve mode replaces system files and boot but retains supported accounts and /home.'
+    Write-Host 'Back up the device first. Other Ubuntu layouts and ID conflicts are refused.'
+    Write-Host 'The temporary installer overwrites boot_a before the tablet can verify the Ubuntu filesystem. A failed check can require boot recovery.'
+    if ((Read-Host 'Type KEEP to continue') -cne 'KEEP') { throw 'Cancelled.' }
+} else { throw 'Invalid installation mode.' }
 $working = Join-Path $root ('work\' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $working | Out-Null
 $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($working))
@@ -111,7 +126,7 @@ try {
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
     $nonce = ([BitConverter]::ToString($bytes)).Replace('-','').ToLowerInvariant()
-    $request = [Text.Encoding]::ASCII.GetBytes("TB710FU-REQUEST:${nonce}:${baselineHash}:100663296`n")
+    $request = [Text.Encoding]::ASCII.GetBytes("TB710FU-REQUEST:${nonce}:${baselineHash}:100663296:${mode}`n")
     $header = New-Object byte[] 4096; [Array]::Copy($request,$header,$request.Length)
     $fs.Position = 1048576; $fs.Write($header,0,$header.Length)
     $bootStream = [IO.File]::OpenRead($baseline)

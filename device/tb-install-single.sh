@@ -1,11 +1,11 @@
 #!/bin/bash
 # Experimental source only. Never install until integration and hardware tests pass.
-# Single-system installation erases userdata/arch. It requires an NBD root.
+# Single-system installation offers clean and existing-Ubuntu preserve modes.
 set -euo pipefail
 fail() { echo "INSTALL FAILED: $*" >&2; exit 1; }
 [ "${TB710FU_ENABLE_UNTESTED_INSTALLER:-}" = yes ] || fail 'Untested development code is disabled'
 [ "$(id -u)" = 0 ] || fail 'root privileges required'
-for cmd in findmnt lsblk sgdisk blockdev mkfs.ext4 rsync sha256sum dd mount umount python3 partprobe swapon reboot; do
+for cmd in findmnt lsblk sgdisk blockdev blkid e2fsck mkfs.ext4 rsync sha256sum dd mount umount python3 partprobe swapon reboot; do
   command -v "$cmd" >/dev/null || fail "missing tool: $cmd"
 done
 model=$(tr '\0' ' ' </sys/firmware/devicetree/base/model)
@@ -16,11 +16,12 @@ root=$(findmnt -n -o SOURCE /)
 [ -b /dev/nbd0p1 ] || fail 'NBD control partition missing'
 [ "$(blockdev --getsize64 /dev/nbd0p1)" = 134217728 ] || fail 'unexpected control partition size'
 request=$(dd if=/dev/nbd0p1 bs=512 count=1 status=none | tr -d '\000' | head -n 1)
-[[ "$request" =~ ^TB710FU-REQUEST:([0-9a-f]{32}):([0-9a-f]{64}):100663296$ ]] || fail 'invalid host installation request'
+[[ "$request" =~ ^TB710FU-REQUEST:([0-9a-f]{32}):([0-9a-f]{64}):100663296:(clean|preserve)$ ]] || fail 'invalid host installation request'
 nonce=${BASH_REMATCH[1]}
 expected=${BASH_REMATCH[2]}
-# Menu-label variant retains the verified original Ubuntu kernel and DTB.
-[ "$expected" = 820d71fce5046b594a0c802623e9a658b3b6f6fa0f976f0090c6f76e9b8258c9 ] || fail 'boot image does not match the verified Ubuntu menu variant'
+mode=${BASH_REMATCH[3]}
+# Current verified kernel/DT is derived from the original Ubuntu baseline.
+[ "$expected" = b2c5db7b73afebf6b83a0b786000e768186c08e27daa6a8907bf24ff5d61bda2 ] || fail 'boot image does not match the verified Ubuntu kernel'
 boot_image=/run/tb710fu-final-boot.img
 [ ! -e "$boot_image" ] || fail 'temporary boot image already exists'
 umask 077
@@ -69,27 +70,63 @@ mkdir -p -m 700 /root/tb-install-backup
 [ ! -e /root/tb-install-backup/gpt-before.bin ] || fail 'backup already exists'
 sgdisk --backup=/root/tb-install-backup/gpt-before.bin "$disk" || fail 'GPT backup failed'
 [ -s /root/tb-install-backup/gpt-before.bin ] || fail 'empty GPT backup'
-# The host request has been checked and all required inputs exist. This is the
-# first destructive operation; the old userdata or arch contents are erased.
-if [ -n "$userdata" ]; then
-  sgdisk --change-name="$number:arch" --typecode="$number:8300" "$disk" || fail 'GPT rename failed'
-  partprobe "$disk" || fail 'partition table rescan failed'
-  [ "$(partdev arch)" = "$target" ] || fail 'renamed partition was not verified'
-fi
-mkfs.ext4 -F -L ubuntu-root "$target" || fail 'filesystem creation failed'
 mkdir -p /mnt/tb-install-target
+account_dir=/run/tb-preserve-accounts
+if [ "$mode" = preserve ]; then
+  [ -n "$arch" ] && [ -z "$userdata" ] || fail 'preserve mode requires a unique existing arch partition'
+  [ "$(blkid -s TYPE -o value "$target")" = ext4 ] || fail 'preserve mode requires ext4'
+  e2fsck -fn "$target" >/dev/null || fail 'existing filesystem requires repair; refusing preserve mode'
+  mount -o ro,noload "$target" /mnt/tb-install-target || fail 'cannot inspect existing Ubuntu'
+  trap 'umount /mnt/tb-install-target 2>/dev/null || true' EXIT
+  python3 /usr/local/libexec/tb-validate-preserve-root.py /mnt/tb-install-target || fail 'unsupported existing Ubuntu layout'
+  python3 /usr/local/libexec/tb-merge-accounts.py --existing /mnt/tb-install-target/etc --release /etc --out "$account_dir" || fail 'incompatible accounts or groups'
+  need_kib=$(df -Pk / | awk 'NR==2 {print $3}')
+  free_kib=$(df -Pk /mnt/tb-install-target | awk 'NR==2 {print $4}')
+  [[ "$need_kib" =~ ^[0-9]+$ && "$free_kib" =~ ^[0-9]+$ ]] || fail 'cannot determine free space'
+  [ "$free_kib" -gt $((need_kib + 1048576)) ] || fail 'not enough free space for preserve mode'
+  umount /mnt/tb-install-target || fail 'cannot unmount validation root'
+  trap - EXIT
+else
+  # Clean mode deliberately destroys the selected userdata or arch contents.
+  if [ -n "$userdata" ]; then
+    sgdisk --change-name="$number:arch" --typecode="$number:8300" "$disk" || fail 'GPT rename failed'
+    partprobe "$disk" || fail 'partition table rescan failed'
+    [ "$(partdev arch)" = "$target" ] || fail 'renamed partition was not verified'
+  fi
+  mkfs.ext4 -F -L ubuntu-root "$target" || fail 'filesystem creation failed'
+fi
 mount -o noatime "$target" /mnt/tb-install-target || fail 'target mount failed'
 trap 'umount /mnt/tb-install-target 2>/dev/null || true' EXIT
-rsync -aHAXx --numeric-ids --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run --exclude=/tmp --exclude=/mnt --exclude=/media --exclude=/var/tmp --exclude=/var/log --exclude=/var/cache --exclude=/etc/machine-id --exclude='/etc/ssh/ssh_host_*' --exclude=/var/lib/systemd/random-seed --exclude=/boot/tbboot / /mnt/tb-install-target/ || fail 'system copy failed'
+excludes=(--exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run --exclude=/tmp --exclude=/mnt --exclude=/media --exclude=/var/tmp --exclude=/var/log --exclude=/var/cache --exclude=/etc/machine-id --exclude='/etc/ssh/ssh_host_*' --exclude=/var/lib/systemd/random-seed --exclude=/boot/tbboot)
+if [ "$mode" = preserve ]; then
+  excludes+=(--exclude=/home --exclude=/root --exclude=/etc/passwd --exclude=/etc/shadow --exclude=/etc/group --exclude=/etc/gshadow --exclude=/etc/subuid --exclude=/etc/subgid --exclude=/etc/fstab --exclude=/etc/hostname --exclude=/etc/hosts --exclude=/etc/sudoers.d --exclude=/etc/gdm3/custom.conf --exclude=/etc/droidloom --exclude=/etc/tb710fu/release-owner-unclaimed --exclude=/etc/NetworkManager/system-connections --exclude=/var/lib/AccountsService --exclude=/var/lib/NetworkManager --exclude=/var/lib/bluetooth --exclude=/var/lib/droidloom --exclude=/var/lib/snapd)
+fi
+rsync -aHAXxc --numeric-ids "${excludes[@]}" / /mnt/tb-install-target/ || fail 'system copy failed'
+if [ "$mode" = preserve ]; then
+  # Older supported Ubuntu installs may not yet have a Droidloom owner.
+  # Keep an existing configuration; otherwise provision the first active user.
+  if [ ! -e /mnt/tb-install-target/etc/droidloom/cell.json ]; then
+    [ ! -L /mnt/tb-install-target/etc/droidloom ] && [ ! -L /mnt/tb-install-target/etc/droidloom/cell.json ] || fail 'unsafe Droidloom target'
+    install -d -m 755 /mnt/tb-install-target/etc/droidloom /mnt/tb-install-target/etc/tb710fu
+    install -m 644 /etc/droidloom/cell.json /mnt/tb-install-target/etc/droidloom/cell.json
+    : > /mnt/tb-install-target/etc/tb710fu/release-owner-unclaimed
+  fi
+  for file in passwd shadow group gshadow; do
+    old="/mnt/tb-install-target/etc/$file"
+    [ -f "$old" ] && [ ! -L "$old" ] || fail 'account database changed during installation'
+    install -m "$(stat -c %a "$old")" -o "$(stat -c %u "$old")" -g "$(stat -c %g "$old")" "$account_dir/$file" "$old.tb-new" || fail 'account staging failed'
+    mv -f "$old.tb-new" "$old" || fail 'account installation failed'
+  done
+fi
 mkdir -p /mnt/tb-install-target/{proc,sys,dev,run,tmp,mnt,media,var/tmp,var/log,var/cache}
 # The installed system must not retain an enabled installer.
 rm -f /mnt/tb-install-target/etc/systemd/system/sysinit.target.wants/tb-installer.service /mnt/tb-install-target/etc/systemd/system/tb-installer.service /mnt/tb-install-target/usr/local/sbin/tb-install-single
 chmod 1777 /mnt/tb-install-target/tmp /mnt/tb-install-target/var/tmp
-: > /mnt/tb-install-target/etc/machine-id
+if [ "$mode" = clean ]; then : > /mnt/tb-install-target/etc/machine-id; fi
 sync
 umount /mnt/tb-install-target
 trap - EXIT
-# Return to the supplied original Ubuntu boot/DT baseline; read back every byte.
+# Install the verified baseline-derived Ubuntu boot and read back every byte.
 dd if="$boot_image" of="$boot" bs=4M conv=fsync status=none || fail 'boot write failed'
 actual=$(dd if="$boot" bs=4M count=$((size/4194304)) status=none | sha256sum | awk '{print $1}')
 [ "$actual" = "$expected" ] || fail 'boot read-back mismatch'

@@ -13,10 +13,12 @@ NONCE = re.compile(r'^[0-9a-f]{32}$')
 DIGEST = re.compile(r'^[0-9a-f]{64}$')
 
 
-def request(nonce, digest):
+def request(nonce, digest, mode='clean'):
     if not NONCE.fullmatch(nonce) or not DIGEST.fullmatch(digest):
         raise ValueError('invalid nonce or boot digest')
-    data = f'TB710FU-REQUEST:{nonce}:{digest}:{BOOT_SIZE}\n'.encode('ascii')
+    if mode not in ('clean', 'preserve'):
+        raise ValueError('invalid installation mode')
+    data = f'TB710FU-REQUEST:{nonce}:{digest}:{BOOT_SIZE}:{mode}\n'.encode('ascii')
     return data.ljust(HEADER_SIZE, b'\0')
 
 
